@@ -39,7 +39,7 @@ def _parse_duration(joined: str | None, ended: str | None, billed: str | None) -
     # Fallback: calculate from joined / ended timestamps
     if joined and ended:
         try:
-            fmt = "%Y-%m-%dT%H:%M:%S.%fZ"
+            fmt = "%Y-%m-%dT%H:%M:%S.%fZ"  # noqa: F841
             def _parse(ts: str):
                 ts = ts.replace("+00:00", "Z")
                 for f in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
@@ -70,28 +70,63 @@ def _extract_medium(medium_obj: dict | None) -> str | None:
     return None
 
 
+def _cursor_from_url(url: str | None) -> str | None:
+    """Extract cursor token from a paginated URL."""
+    if not url:
+        return None
+    for part in url.split("&"):
+        if "cursor=" in part:
+            return part.split("cursor=")[-1]
+    return None
+
+
+def _parse_iso(ts: str | None) -> datetime | None:
+    """Parse an ISO 8601 timestamp to a timezone-aware datetime."""
+    if not ts:
+        return None
+    try:
+        ts = ts.replace("+00:00", "Z")
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(ts, fmt)
+                return dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+    except Exception:
+        pass
+    return None
+
+
 @router.get("/calls", response_model=CallsListResponse)
 async def list_calls(
-    page_size: int = Query(20, ge=1, le=100),
-    cursor: str | None = Query(None),
+    page_size:  int          = Query(20, ge=1, le=100),
+    cursor:     str | None   = Query(None),
+    date_from:  str | None   = Query(None, description="ISO date, e.g. 2026-01-01"),
+    date_to:    str | None   = Query(None, description="ISO date, e.g. 2026-01-31"),
+    medium:     str | None   = Query(None, description="e.g. plivo, webRtc, twilio"),
 ):
     """
     GET /logs/calls
-    Returns all calls for the configured agent, newest first.
+    Returns calls for the configured agent, newest first.
+    When date_from / date_to / medium filters are supplied the backend fetches
+    pages from Ultravox until the date window is exhausted (max 50 pages) and
+    returns all matching results in one shot (no cursor).
+    Without filters, normal cursor-based pagination applies.
     """
     agent_id = os.getenv("AGENT_ID", "").strip().strip("'\"")
     if not agent_id:
         raise HTTPException(status_code=500, detail="AGENT_ID is not configured.")
 
-    try:
-        data = await get_agent_calls(agent_id, cursor=cursor, page_size=page_size)
-    except Exception as e:
-        logger.error(f"Failed to fetch calls: {e}")
-        raise HTTPException(status_code=502, detail=f"Ultravox API error: {str(e)}")
+    filtering = bool(date_from or date_to or medium)
 
-    results = []
-    for call in data.get("results", []):
-        results.append(CallSummary(
+    dt_from = _parse_iso(date_from)
+    dt_to   = _parse_iso(date_to)
+    # date_to means end of that day
+    if dt_to:
+        dt_to = dt_to.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    def _to_summary(call: dict) -> CallSummary:
+        return CallSummary(
             callId       = call.get("callId", ""),
             created      = call.get("created"),
             joined       = call.get("joined"),
@@ -104,16 +139,60 @@ async def list_calls(
             endReason    = call.get("endReason"),
             shortSummary = call.get("shortSummary"),
             medium       = _extract_medium(call.get("medium")),
-        ))
+        )
 
-    # Extract cursor tokens from the next/previous URLs
-    def _cursor_from_url(url: str | None) -> str | None:
-        if not url:
-            return None
-        for part in url.split("&"):
-            if part.startswith("cursor=") or "cursor=" in part:
-                return part.split("cursor=")[-1]
-        return None
+    # ── Filtered mode: fetch pages until date window exhausted ───────────────
+    if filtering:
+        MAX_PAGES   = 50
+        results     = []
+        page_cursor = None  # always start from newest
+        done        = False
+
+        for _ in range(MAX_PAGES):
+            try:
+                data = await get_agent_calls(agent_id, cursor=page_cursor, page_size=100)
+            except Exception as e:
+                logger.error(f"Failed to fetch calls: {e}")
+                raise HTTPException(status_code=502, detail=f"Ultravox API error: {str(e)}")
+
+            for call in data.get("results", []):
+                summary   = _to_summary(call)
+                call_time = _parse_iso(summary.created)
+
+                # Calls come newest-first; once we're older than date_from, stop.
+                if dt_from and call_time and call_time < dt_from:
+                    done = True
+                    break
+
+                # Skip calls newer than date_to
+                if dt_to and call_time and call_time > dt_to:
+                    continue
+
+                # Filter by medium
+                if medium and summary.medium != medium:
+                    continue
+
+                results.append(summary)
+
+            if done or not data.get("next"):
+                break
+            page_cursor = _cursor_from_url(data.get("next"))
+
+        return CallsListResponse(
+            total    = len(results),
+            next     = None,
+            previous = None,
+            results  = results,
+        )
+
+    # ── Normal paginated mode ────────────────────────────────────────────────
+    try:
+        data = await get_agent_calls(agent_id, cursor=cursor, page_size=page_size)
+    except Exception as e:
+        logger.error(f"Failed to fetch calls: {e}")
+        raise HTTPException(status_code=502, detail=f"Ultravox API error: {str(e)}")
+
+    results = [_to_summary(call) for call in data.get("results", [])]
 
     return CallsListResponse(
         total    = data.get("total", len(results)),
