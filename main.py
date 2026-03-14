@@ -6,12 +6,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv, set_key
 
-from helpers.ultravox import create_agent, patch_agent
+from helpers.ultravox import create_agent, patch_agent, list_webhooks, register_webhook
 from helpers.prompts import SYSTEM_PROMPT
 from routers.call import router as call_router
 from routers.jd import router as jd_router
 from routers.outbound import router as outbound_router
 from routers.logs import router as logs_router
+from routers.webhook import router as webhook_router
 
 load_dotenv()
 
@@ -19,6 +20,66 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
+
+
+async def ensure_webhook(agent_id: str):
+    """
+    On startup: register the Ultravox webhook if not already registered.
+    Checks existing webhooks first to avoid duplicates on every redeploy.
+    Stores the webhookId in .env / env so it's only registered once.
+    """
+    webhook_id = os.getenv("WEBHOOK_ID", "").strip()
+    if webhook_id:
+        logger.info(f"Webhook already registered: {webhook_id} — skipping")
+        return
+
+    backend_url    = os.getenv("BACKEND_URL", "").strip().rstrip("/")
+    webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
+
+    if not backend_url:
+        logger.warning("BACKEND_URL not set — skipping webhook registration")
+        return
+    if not webhook_secret:
+        logger.warning("WEBHOOK_SECRET not set — skipping webhook registration")
+        return
+
+    webhook_url = f"{backend_url}/webhook/ultravox"
+
+    # Check if a webhook for this agent already exists (e.g. from a previous deploy)
+    try:
+        existing = await list_webhooks(agent_id)
+        for wh in existing:
+            if wh.get("url") == webhook_url:
+                wh_id = wh["webhookId"]
+                logger.info(f"Webhook already exists on Ultravox: {wh_id} — saving to env")
+                os.environ["WEBHOOK_ID"] = wh_id
+                try:
+                    set_key(ENV_PATH, "WEBHOOK_ID", wh_id)
+                except Exception:
+                    pass
+                return
+    except Exception as e:
+        logger.warning(f"Could not check existing webhooks: {e}")
+
+    # Register a new webhook
+    try:
+        wh = await register_webhook(
+            url=webhook_url,
+            agent_id=agent_id,
+            secret=webhook_secret,
+        )
+        wh_id = wh["webhookId"]
+        logger.info(f"✅ Webhook registered: {wh_id} → {webhook_url}")
+        os.environ["WEBHOOK_ID"] = wh_id
+        try:
+            set_key(ENV_PATH, "WEBHOOK_ID", wh_id)
+        except Exception:
+            logger.warning(
+                f"Could not write WEBHOOK_ID to .env. "
+                f"Set WEBHOOK_ID={wh_id} in your Railway environment variables."
+            )
+    except Exception as e:
+        logger.error(f"Failed to register webhook: {e}")
 
 
 async def ensure_agent():
@@ -89,6 +150,9 @@ async def ensure_agent():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await ensure_agent()
+    agent_id = os.getenv("AGENT_ID", "").strip().strip("'\"")
+    if agent_id:
+        await ensure_webhook(agent_id)
     yield
 
 
@@ -111,6 +175,7 @@ app.include_router(jd_router)
 app.include_router(call_router)
 app.include_router(outbound_router)
 app.include_router(logs_router)
+app.include_router(webhook_router)
 
 
 @app.get("/health")

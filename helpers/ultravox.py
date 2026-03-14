@@ -145,16 +145,7 @@ async def create_outbound_call(
     JD content is fetched via the queryCorpus RAG tool during the call.
     Note: No joinUrl — audio flows phone ↔ Twilio ↔ Ultravox AI.
     """
-    # payload: dict = {
-    #     "medium": {
-    #         "twilio": {
-    #             "outgoing": {
-    #                 "to": to_number,
-    #                 "from": from_number,
-    #             }
-    #         }
-    #     },
-    # }
+    
     payload: dict = {
         "medium": {
             "plivo": {
@@ -240,6 +231,20 @@ async def get_call_recording(call_id: str) -> httpx.Response:
         return response
 
 
+async def get_call(call_id: str) -> dict:
+    """
+    GET https://api.ultravox.ai/api/calls/{call_id}
+    Returns the full call object including joined, ended, endReason.
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(
+            f"{ULTRAVOX_BASE_URL}/calls/{call_id}",
+            headers=_headers(),
+        )
+        response.raise_for_status()
+        return response.json()
+
+
 async def get_agent(agent_id: str) -> dict:
     """
     GET https://api.ultravox.ai/api/agents/{agent_id}
@@ -249,6 +254,43 @@ async def get_agent(agent_id: str) -> dict:
         response = await client.get(
             f"{ULTRAVOX_BASE_URL}/agents/{agent_id}",
             headers=_headers(),
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+async def list_webhooks(agent_id: str) -> list:
+    """
+    GET https://api.ultravox.ai/api/webhooks?agentId={agent_id}
+    Returns existing webhooks scoped to this agent.
+    """
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.get(
+            f"{ULTRAVOX_BASE_URL}/webhooks",
+            headers=_headers(),
+            params={"agentId": agent_id},
+        )
+        response.raise_for_status()
+        return response.json().get("results", [])
+
+
+async def register_webhook(url: str, agent_id: str, secret: str) -> dict:
+    """
+    POST https://api.ultravox.ai/api/webhooks
+    Registers a webhook for all call lifecycle events, scoped to agent_id.
+    Returns the created webhook object (includes webhookId).
+    """
+    payload = {
+        "url": url,
+        "agentId": agent_id,
+        "events": ["call.started", "call.joined", "call.ended", "call.billed"],
+        "secrets": [secret],
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            f"{ULTRAVOX_BASE_URL}/webhooks",
+            headers=_headers(),
+            json=payload,
         )
         response.raise_for_status()
         return response.json()
