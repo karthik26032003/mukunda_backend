@@ -3,13 +3,28 @@ from pydantic import BaseModel, field_validator
 
 
 def _validate_e164(v: str) -> str:
-    v = v.strip().replace(" ", "").replace("-", "")
-    if not re.match(r"^\+\d{7,15}$", v):
+    """
+    Accept Indian numbers in any common format and normalize to E.164.
+      9876543210      → +919876543210
+      919876543210    → +919876543210
+      +919876543210   → +919876543210 (unchanged)
+    """
+    cleaned = v.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+
+    if cleaned.startswith("+91"):
+        digits = cleaned[3:]
+    elif cleaned.startswith("91") and len(cleaned) == 12:
+        digits = cleaned[2:]
+    elif re.match(r"^\+\d{7,15}$", cleaned):
+        return cleaned  # non-Indian E.164 — pass through as-is
+    else:
+        digits = cleaned.lstrip("+")
+
+    if not re.match(r"^\d{10}$", digits):
         raise ValueError(
-            "Phone number must be in E.164 format: +[country_code][number]  "
-            "e.g. +919876543210"
+            "Enter a valid 10-digit Indian number, e.g. 9876543210 or +919876543210"
         )
-    return v
+    return f"+91{digits}"
 
 
 class OutboundCallRequest(BaseModel):
