@@ -20,6 +20,9 @@ import os
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
+import helpers.db as db
+from helpers.ultravox import create_outbound_call
+
 logger = logging.getLogger("webhook")
 
 router = APIRouter(prefix="/webhook", tags=["webhook"])
@@ -133,20 +136,26 @@ async def ultravox_webhook(request: Request) -> Response:
         logger.error(f"Failed to parse webhook payload: {e}")
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    call_id = call.get("callId", "unknown")
-    label   = _extract_label(call)
+    call_id  = call.get("callId", "unknown")
+    label    = _extract_label(call)
+    metadata = call.get("metadata") or {}
+    batch_id = metadata.get("batch_id")
 
     # ── Log each event ────────────────────────────────────────────────────────
     if event == "call.started":
         logger.info(
             f"✅ CALL STARTED    callId={call_id} | {label}"
+            + (f" | batch={batch_id}" if batch_id else "")
         )
 
     elif event == "call.joined":
         joined_at = call.get("joined", "unknown")
         logger.info(
             f"📞 CALL JOINED     callId={call_id} | {label} | at={joined_at}"
+            + (f" | batch={batch_id}" if batch_id else "")
         )
+        if batch_id:
+            await db.update_call_status(call_id, "joined")
 
     elif event == "call.ended":
         end_reason = call.get("endReason") or "unknown"
@@ -156,7 +165,51 @@ async def ultravox_webhook(request: Request) -> Response:
             f"🔴 CALL ENDED      callId={call_id} | {label} | "
             f"reason={end_reason} | duration={duration}"
             + (f" | summary: {summary}" if summary else "")
+            + (f" | batch={batch_id}" if batch_id else "")
         )
+
+        if batch_id:
+            # A call is "succeeded" if it was answered (joined timestamp present)
+            succeeded = bool(call.get("joined"))
+            error_msg = end_reason if not succeeded else None
+
+            await db.update_call_status(
+                call_id,
+                "ended" if succeeded else end_reason,
+                error_msg,
+            )
+            batch_row = await db.close_call_on_batch(batch_id, succeeded)
+
+            if not batch_row:
+                logger.warning(f"Batch {batch_id} not found in DB after call.ended")
+            elif batch_row.get("queued", 0) > 0:
+                # Pop and start the next queued call
+                agent_id    = batch_row["agent_id"]
+                from_number = batch_row["from_number"]
+                next_number = await db.pop_next_queued(batch_id)
+                if next_number:
+                    try:
+                        next_call = await create_outbound_call(
+                            agent_id=agent_id,
+                            to_number=next_number,
+                            from_number=from_number,
+                            metadata={"batch_id": batch_id},
+                        )
+                        await db.set_call_id(batch_id, next_number, next_call["callId"])
+                        logger.info(
+                            f"Batch {batch_id}: next call started "
+                            f"callId={next_call['callId']} → {next_number}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Batch {batch_id}: failed to start next call → {next_number}: {e}"
+                        )
+                        await db.update_call_status_by_phone(batch_id, next_number, "failed", str(e))
+                        await db.close_call_on_batch(batch_id, succeeded=False)
+            elif batch_row.get("active", 0) == 0:
+                # No active and no queued → batch is done
+                await db.mark_batch_complete(batch_id)
+                logger.info(f"Batch {batch_id}: all calls complete ✅")
 
     elif event == "call.billed":
         billed_dur = call.get("billedDuration") or "unknown"

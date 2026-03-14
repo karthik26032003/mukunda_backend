@@ -1,14 +1,17 @@
-import asyncio
 import os
 import logging
+from uuid import uuid4
+
 from fastapi import APIRouter, HTTPException
+
+import helpers.db as db
 from helpers.ultravox import create_outbound_call
 from models.outbound import (
     OutboundCallRequest,
     OutboundCallResponse,
     OutboundBatchRequest,
-    OutboundBatchResponse,
-    OutboundBatchResult,
+    BatchStartResponse,
+    BatchStatusResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,49 +94,80 @@ async def initiate_outbound_call(body: OutboundCallRequest):
     )
 
 
-@router.post("/calls/batch", response_model=OutboundBatchResponse)
+@router.post("/calls/batch", response_model=BatchStartResponse)
 async def initiate_batch_outbound_calls(body: OutboundBatchRequest):
     """
     POST /outbound/calls/batch
-    Fire multiple outbound calls concurrently using asyncio.gather.
-    Each number gets its own independent Ultravox call session.
-    Returns a per-number success/failure summary.
+    Queue all numbers in the DB, then fire the first CONCURRENCY calls immediately.
+    Subsequent calls are triggered by the webhook on each call.ended event.
+    Returns a batch_id for polling /outbound/batch/{batch_id}.
     """
     agent_id, from_number = _get_config()
 
-    logger.info(
-        f"Batch outbound: {len(body.phone_numbers)} numbers | agent: {agent_id}"
-    )
+    pool = db.get_pool()
+    if not pool:
+        raise HTTPException(
+            status_code=503,
+            detail="Database not available. Batch calls require DATABASE_URL.",
+        )
 
-    async def _call_one(number: str) -> OutboundBatchResult:
-        normalized = _normalize_phone(number)
+    phone_numbers = body.phone_numbers  # already normalized by Pydantic validator
+    batch_id = str(uuid4())
+    total = len(phone_numbers)
+
+    logger.info(f"Batch {batch_id}: {total} numbers | agent: {agent_id}")
+
+    await db.create_batch(batch_id, agent_id, from_number, total)
+    await db.insert_batch_calls(batch_id, phone_numbers)
+
+    # Fire the first CONCURRENCY calls immediately
+    started = 0
+    for _ in range(min(db.get_concurrency(), total)):
+        number = await db.pop_next_queued(batch_id)
+        if not number:
+            break
         try:
             call = await create_outbound_call(
                 agent_id=agent_id,
-                to_number=normalized,
+                to_number=number,
                 from_number=from_number,
+                metadata={"batch_id": batch_id},
             )
-            logger.info(f"Batch call OK: callId={call['callId']} → {normalized}")
-            return OutboundBatchResult(
-                phone_number=normalized,
-                success=True,
-                callId=call["callId"],
-            )
+            await db.set_call_id(batch_id, number, call["callId"])
+            logger.info(f"Batch {batch_id}: started callId={call['callId']} → {number}")
+            started += 1
         except Exception as e:
-            logger.error(f"Batch call FAILED → {normalized}: {e}")
-            return OutboundBatchResult(
-                phone_number=normalized,
-                success=False,
-                error=str(e),
-            )
+            logger.error(f"Batch {batch_id}: failed to start call → {number}: {e}")
+            await db.update_call_status_by_phone(batch_id, number, "failed", str(e))
+            await db.close_call_on_batch(batch_id, succeeded=False)
 
-    results = await asyncio.gather(*[_call_one(num) for num in body.phone_numbers])
+    queued = total - started
+    return BatchStartResponse(
+        batch_id=batch_id,
+        total=total,
+        started=started,
+        queued=queued,
+        message=f"Batch queued. {started} calls active, {queued} waiting.",
+    )
 
-    succeeded = sum(1 for r in results if r.success)
 
-    return OutboundBatchResponse(
-        total=len(results),
-        succeeded=succeeded,
-        failed=len(results) - succeeded,
-        results=list(results),
+@router.get("/batch/{batch_id}", response_model=BatchStatusResponse)
+async def get_batch_status(batch_id: str):
+    """
+    GET /outbound/batch/{batch_id}
+    Returns the current status of a batch call job.
+    """
+    row = await db.get_batch(batch_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    return BatchStatusResponse(
+        batch_id=row["batch_id"],
+        status=row["status"],
+        total=row["total"],
+        active=row["active"],
+        queued=row["queued"],
+        succeeded=row["succeeded"],
+        failed=row["failed"],
+        created_at=row["created_at"].isoformat(),
     )

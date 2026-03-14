@@ -8,6 +8,7 @@ from dotenv import load_dotenv, set_key
 
 from helpers.ultravox import create_agent, patch_agent, list_webhooks, register_webhook
 from helpers.prompts import SYSTEM_PROMPT
+import helpers.db as db
 from routers.call import router as call_router
 from routers.jd import router as jd_router
 from routers.outbound import router as outbound_router
@@ -149,11 +150,18 @@ async def ensure_agent():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # DB first — other startup steps may need it
+    await db.init_pool()
+    await db.create_tables()
+    await db.mark_failed_initiated_calls()  # clean up any stale 'initiated' from crashed run
+
     await ensure_agent()
     agent_id = os.getenv("AGENT_ID", "").strip().strip("'\"")
     if agent_id:
         await ensure_webhook(agent_id)
     yield
+
+    await db.close_pool()
 
 
 app = FastAPI(

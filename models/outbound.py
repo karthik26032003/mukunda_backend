@@ -68,3 +68,24 @@ class OutboundBatchResponse(BaseModel):
     succeeded: int
     failed: int
     results: list[OutboundBatchResult]
+
+
+# ── DB-backed batch queue models ──────────────────────────────────────────────
+
+class BatchStartResponse(BaseModel):
+    batch_id: str
+    total: int
+    started: int
+    queued: int
+    message: str
+
+
+class BatchStatusResponse(BaseModel):
+    batch_id: str
+    status: str        # running | completed
+    total: int
+    active: int
+    queued: int
+    succeeded: int
+    failed: int
+    created_at: str
