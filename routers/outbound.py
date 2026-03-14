@@ -16,6 +16,29 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/outbound", tags=["outbound"])
 
 
+def _normalize_phone(number: str) -> str:
+    """
+    Normalize an Indian phone number to E.164 format (+91XXXXXXXXXX).
+
+    Accepts:
+      9876543210      → +919876543210
+      919876543210    → +919876543210
+      +919876543210   → +919876543210
+      +91 98765 43210 → +919876543210
+    """
+    # Strip all spaces, dashes, parentheses
+    cleaned = number.strip().replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+
+    if cleaned.startswith("+91"):
+        digits = cleaned[3:]
+    elif cleaned.startswith("91") and len(cleaned) == 12:
+        digits = cleaned[2:]
+    else:
+        digits = cleaned.lstrip("+")
+
+    return f"+91{digits}"
+
+
 def _get_config() -> tuple[str, str]:
     """Returns (agent_id, from_number) or raises HTTPException."""
     agent_id    = os.getenv("AGENT_ID", "").strip().strip("'\"")
@@ -42,12 +65,13 @@ async def initiate_outbound_call(body: OutboundCallRequest):
     """
     agent_id, from_number = _get_config()
 
-    logger.info(f"Outbound call → {body.phone_number} | agent: {agent_id}")
+    to_number = _normalize_phone(body.phone_number)
+    logger.info(f"Outbound call → {to_number} (raw: {body.phone_number}) | agent: {agent_id}")
 
     try:
         call = await create_outbound_call(
             agent_id=agent_id,
-            to_number=body.phone_number,
+            to_number=to_number,
             from_number=from_number,
         )
     except Exception as e:
@@ -62,8 +86,8 @@ async def initiate_outbound_call(body: OutboundCallRequest):
     return OutboundCallResponse(
         callId=call["callId"],
         status="initiated",
-        to_number=body.phone_number,
-        message=f"Calling {body.phone_number}. The AI will connect shortly.",
+        to_number=to_number,
+        message=f"Calling {to_number}. The AI will connect shortly.",
     )
 
 
@@ -82,22 +106,23 @@ async def initiate_batch_outbound_calls(body: OutboundBatchRequest):
     )
 
     async def _call_one(number: str) -> OutboundBatchResult:
+        normalized = _normalize_phone(number)
         try:
             call = await create_outbound_call(
                 agent_id=agent_id,
-                to_number=number,
+                to_number=normalized,
                 from_number=from_number,
             )
-            logger.info(f"Batch call OK: callId={call['callId']} → {number}")
+            logger.info(f"Batch call OK: callId={call['callId']} → {normalized}")
             return OutboundBatchResult(
-                phone_number=number,
+                phone_number=normalized,
                 success=True,
                 callId=call["callId"],
             )
         except Exception as e:
-            logger.error(f"Batch call FAILED → {number}: {e}")
+            logger.error(f"Batch call FAILED → {normalized}: {e}")
             return OutboundBatchResult(
-                phone_number=number,
+                phone_number=normalized,
                 success=False,
                 error=str(e),
             )
